@@ -21,9 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------------
       # 1. Find and extract the project ZIP (repo root, any letter case)
-      # ---------------------------------------------------------------
       - name: Find and extract project ZIP
         run: |
           set -euo pipefail
@@ -49,9 +47,7 @@ jobs:
           echo "Top-level contents:"
           ls -la "$WORK"
 
-      # ---------------------------------------------------------------
       # 2. Locate the real Gradle project root and the app module
-      # ---------------------------------------------------------------
       - name: Locate Gradle project root and application module
         run: |
           set -euo pipefail
@@ -81,25 +77,33 @@ jobs:
           echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "APP_MODULE=$MODULE" >> "$GITHUB_ENV"
 
-      # ---------------------------------------------------------------
       # 3. JDK 17 (required by Android Gradle Plugin 9.x / Gradle 9.x)
-      # ---------------------------------------------------------------
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # ---------------------------------------------------------------
-      # 4. Android SDK (licenses accepted; AGP downloads compileSdk 36.1)
-      # ---------------------------------------------------------------
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # 4. Android SDK (preinstalled on the runner; just accept licenses)
+      - name: Accept Android SDK licenses (preinstalled SDK)
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -path '*/bin/sdkmanager' -type f | sort | tail -n1)"
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found in the runner's Android SDK."
+            exit 1
+          fi
+          echo "Using $SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          set -o pipefail
+          echo "Licenses accepted."
 
-      # ---------------------------------------------------------------
       # 5. Local files the project needs but does not ship
-      #    (done only inside the temporary extracted copy)
-      # ---------------------------------------------------------------
       - name: Prepare local configuration
         run: |
           set -euo pipefail
@@ -107,7 +111,7 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           # app/build.gradle.kts signs debug builds with ${rootDir}/debug.keystore
-          # (listed in the project's .gitignore, so it is not in the ZIP).
+          # (gitignored, so it is not in the ZIP).
           if [ ! -f debug.keystore ]; then
             keytool -genkeypair -v \
               -keystore debug.keystore \
@@ -121,11 +125,8 @@ jobs:
           echo "Wrapper properties:"
           cat gradle/wrapper/gradle-wrapper.properties
 
-      # ---------------------------------------------------------------
-      # 6. Gradle: use the project's wrapper if complete, otherwise
-      #    install the EXACT version pinned in gradle-wrapper.properties
-      #    (the ZIP has the .properties file but no gradlew / wrapper jar)
-      # ---------------------------------------------------------------
+      # 6. Gradle: use the project's wrapper if complete, otherwise install
+      #    the exact version pinned in gradle-wrapper.properties
       - name: Provide Gradle
         run: |
           set -euo pipefail
@@ -158,18 +159,14 @@ jobs:
           "$GRADLE_BIN" --version
           echo "GRADLE_CMD=$GRADLE_BIN" >> "$GITHUB_ENV"
 
-      # ---------------------------------------------------------------
-      # 7. Build the debug APK (no release keystore exists in the project)
-      # ---------------------------------------------------------------
+      # 7. Build the debug APK
       - name: Build debug APK
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
           "$GRADLE_CMD" ":${APP_MODULE}:assembleDebug" --stacktrace --no-daemon
 
-      # ---------------------------------------------------------------
       # 8. Find the real APK; fail if none / empty
-      # ---------------------------------------------------------------
       - name: Locate generated APK
         run: |
           set -euo pipefail
@@ -193,9 +190,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # ---------------------------------------------------------------
-      # Diagnostics when something fails
-      # ---------------------------------------------------------------
       - name: Failure diagnostics
         if: failure()
         run: |
