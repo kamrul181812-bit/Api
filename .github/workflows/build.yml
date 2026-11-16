@@ -1,1 +1,210 @@
+name: Build DCS API Inspector APK
 
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Find and extract the project ZIP (repo root, any letter case)
+      # ---------------------------------------------------------------
+      - name: Find and extract project ZIP
+        run: |
+          set -euo pipefail
+          mapfile -t ZIPS < <(find . -maxdepth 1 -type f -iname '*.zip' | sort)
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "::error::No .zip file found in the repository root. Upload DCS-API-INSPECTOR.zip to the root of the repo."
+            exit 1
+          fi
+          ZIP="${ZIPS[0]}"
+          for z in "${ZIPS[@]}"; do
+            case "$(basename "$z" | tr 'A-Z' 'a-z')" in
+              dcs-api-inspector.zip) ZIP="$z" ;;
+            esac
+          done
+          echo "Using ZIP: $ZIP"
+          unzip -tq "$ZIP"
+          WORK="$RUNNER_TEMP/project"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -q "$ZIP" -d "$WORK"
+          rm -rf "$WORK/__MACOSX"
+          echo "WORK_DIR=$WORK" >> "$GITHUB_ENV"
+          echo "Top-level contents:"
+          ls -la "$WORK"
+
+      # ---------------------------------------------------------------
+      # 2. Locate the real Gradle project root and the app module
+      # ---------------------------------------------------------------
+      - name: Locate Gradle project root and application module
+        run: |
+          set -euo pipefail
+          SETTINGS="$(find "$WORK_DIR" -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+            -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' -not -path '*/build/*' \
+            | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No settings.gradle(.kts) found inside the ZIP. This is not a Gradle Android project."
+            exit 1
+          fi
+          ROOT="$(dirname "$SETTINGS")"
+          echo "Gradle project root: $ROOT"
+
+          MODULE=""
+          for f in "$ROOT"/*/build.gradle.kts "$ROOT"/*/build.gradle; do
+            [ -f "$f" ] || continue
+            if grep -Eq 'android\.application|com\.android\.application' "$f"; then
+              MODULE="$(basename "$(dirname "$f")")"
+              break
+            fi
+          done
+          if [ -z "$MODULE" ]; then
+            echo "::error::No Android application module (plugin android.application) found under $ROOT."
+            exit 1
+          fi
+          echo "Application module: $MODULE"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "APP_MODULE=$MODULE" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 3. JDK 17 (required by Android Gradle Plugin 9.x / Gradle 9.x)
+      # ---------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ---------------------------------------------------------------
+      # 4. Android SDK (licenses accepted; AGP downloads compileSdk 36.1)
+      # ---------------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ---------------------------------------------------------------
+      # 5. Local files the project needs but does not ship
+      #    (done only inside the temporary extracted copy)
+      # ---------------------------------------------------------------
+      - name: Prepare local configuration
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          # app/build.gradle.kts signs debug builds with ${rootDir}/debug.keystore
+          # (listed in the project's .gitignore, so it is not in the ZIP).
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          [ -f gradlew ] && chmod +x gradlew || true
+          echo "Wrapper properties:"
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      # ---------------------------------------------------------------
+      # 6. Gradle: use the project's wrapper if complete, otherwise
+      #    install the EXACT version pinned in gradle-wrapper.properties
+      #    (the ZIP has the .properties file but no gradlew / wrapper jar)
+      # ---------------------------------------------------------------
+      - name: Provide Gradle
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "Using project Gradle wrapper."
+            echo "GRADLE_CMD=$PWD/gradlew" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "Gradle wrapper (gradlew / gradle-wrapper.jar) missing from ZIP; installing the pinned version."
+          PROPS=gradle/wrapper/gradle-wrapper.properties
+          if [ ! -f "$PROPS" ]; then
+            echo "::error::gradle/wrapper/gradle-wrapper.properties is missing, so the required Gradle version is unknown."
+            exit 1
+          fi
+          URL="$(grep '^distributionUrl=' "$PROPS" | cut -d= -f2- | tr -d '\r' | sed 's#\\##g')"
+          echo "Gradle distribution: $URL"
+          case "$URL" in
+            https://services.gradle.org/distributions/gradle-*-bin.zip|https://services.gradle.org/distributions/gradle-*-all.zip) ;;
+            *) echo "::error::Unexpected distributionUrl: $URL"; exit 1 ;;
+          esac
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gradle.zip" "$URL"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle-dist"
+          GRADLE_BIN="$(find "$RUNNER_TEMP/gradle-dist" -maxdepth 3 -path '*/bin/gradle' -type f | head -n1)"
+          if [ -z "$GRADLE_BIN" ]; then
+            echo "::error::Could not find bin/gradle in the downloaded distribution."
+            exit 1
+          fi
+          chmod +x "$GRADLE_BIN"
+          "$GRADLE_BIN" --version
+          echo "GRADLE_CMD=$GRADLE_BIN" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 7. Build the debug APK (no release keystore exists in the project)
+      # ---------------------------------------------------------------
+      - name: Build debug APK
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          "$GRADLE_CMD" ":${APP_MODULE}:assembleDebug" --stacktrace --no-daemon
+
+      # ---------------------------------------------------------------
+      # 8. Find the real APK; fail if none / empty
+      # ---------------------------------------------------------------
+      - name: Locate generated APK
+        run: |
+          set -euo pipefail
+          OUT="$PROJECT_ROOT/$APP_MODULE/build/outputs/apk/debug"
+          APK="$(find "$OUT" -maxdepth 1 -type f -name '*.apk' ! -name '*unaligned*' | head -n1 || true)"
+          if [ -z "$APK" ] || [ ! -s "$APK" ]; then
+            echo "::error::No non-empty APK found in $OUT"
+            ls -laR "$PROJECT_ROOT/$APP_MODULE/build/outputs" 2>/dev/null || true
+            exit 1
+          fi
+          echo "APK: $APK ($(stat -c%s "$APK") bytes)"
+          mkdir -p "$RUNNER_TEMP/apk-out"
+          cp "$APK" "$RUNNER_TEMP/apk-out/"
+          echo "APK_DIR=$RUNNER_TEMP/apk-out" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DCS-API-INSPECTOR-APK
+          path: ${{ env.APK_DIR }}/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------------
+      # Diagnostics when something fails
+      # ---------------------------------------------------------------
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          echo "ZIP work dir: ${WORK_DIR:-unset}"
+          echo "Project root: ${PROJECT_ROOT:-unset}"
+          echo "App module:   ${APP_MODULE:-unset}"
+          if [ -n "${PROJECT_ROOT:-}" ] && [ -d "$PROJECT_ROOT" ]; then
+            find "$PROJECT_ROOT" -maxdepth 2 -not -path '*/.git/*' | head -n 80
+            for r in "$PROJECT_ROOT"/*/build/reports/problems; do
+              [ -d "$r" ] && ls -la "$r"
+            done || true
+          fi
